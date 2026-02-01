@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Upload, FolderOutput, Scissors, Image as ImageIcon, Play, AlertCircle, FileVideo, CheckCircle, Terminal, Globe, Link as LinkIcon, Download, X, RefreshCw, Info, Wand2 } from 'lucide-react';
+import { Upload, FolderOutput, Scissors, Image as ImageIcon, Play, AlertCircle, FileVideo, CheckCircle, Terminal, Globe, Link as LinkIcon, Download, X, RefreshCw, Info, Wand2, HardDrive } from 'lucide-react';
 import { Button } from './components/ui/Button';
 import { ProcessingMode, AppStatus, FileSystemDirectoryHandle, LogMessage } from './types';
 import { ffmpegService } from './utils/ffmpegService';
@@ -10,6 +10,9 @@ export default function App() {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   // State quản lý thư mục đầu ra
   const [outputDir, setOutputDir] = useState<FileSystemDirectoryHandle | null>(null);
+  // State chế độ fallback (khi không chọn được thư mục)
+  const [isFallbackMode, setIsFallbackMode] = useState<boolean>(false);
+  
   // State chế độ xử lý (Cắt hoặc Trích xuất ảnh)
   const [mode, setMode] = useState<ProcessingMode>(ProcessingMode.EXTRACT_FRAMES);
   // State số giây cắt (cho chế độ cắt video)
@@ -73,13 +76,10 @@ export default function App() {
 
   /**
    * Helper: Trích xuất video từ link mạng xã hội (Youtube, Facebook, TikTok...)
-   * Sử dụng API public của Cobalt để lấy link trực tiếp
    */
   const extractSocialVideo = async (url: string): Promise<string> => {
     try {
       setDownloadProgress('Đang phân tích link và tìm video gốc...');
-      
-      // Sử dụng Cobalt API public instance
       const response = await fetch('https://api.cobalt.tools/api/json', {
         method: 'POST',
         headers: {
@@ -89,24 +89,12 @@ export default function App() {
         body: JSON.stringify({ url: url })
       });
 
-      if (!response.ok) {
-        throw new Error(`API Trích xuất lỗi (Status ${response.status})`);
-      }
-
+      if (!response.ok) throw new Error(`API Trích xuất lỗi (Status ${response.status})`);
       const data = await response.json();
       
-      if (data.status === 'stream' || data.status === 'redirect') {
-        return data.url;
-      }
-      
-      if (data.status === 'picker' && data.picker && data.picker.length > 0) {
-        return data.picker[0].url;
-      }
-
-      if (data.status === 'error') {
-         throw new Error(data.text || "Không tìm thấy video từ link này.");
-      }
-
+      if (data.status === 'stream' || data.status === 'redirect') return data.url;
+      if (data.status === 'picker' && data.picker && data.picker.length > 0) return data.picker[0].url;
+      if (data.status === 'error') throw new Error(data.text || "Không tìm thấy video từ link này.");
       throw new Error("Không tìm thấy link video trực tiếp.");
     } catch (error) {
       console.warn("Extraction failed:", error);
@@ -115,10 +103,9 @@ export default function App() {
   };
 
   /**
-   * Helper: Thử fetch video qua nhiều cách (Trực tiếp -> Proxy 1 -> Proxy 2)
+   * Helper: Thử fetch video qua nhiều cách (Trực tiếp -> Proxy)
    */
   const fetchWithFallback = async (url: string): Promise<Response> => {
-    // Danh sách các chiến lược tải
     const strategies = [
       { name: 'Trực tiếp (Direct)', fn: (u: string) => u },
       { name: 'Proxy 1 (corsproxy.io)', fn: (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}` },
@@ -126,42 +113,22 @@ export default function App() {
     ];
 
     let lastError: any;
-
     for (const strategy of strategies) {
       try {
         setDownloadProgress(`Đang tải dữ liệu: ${strategy.name}...`);
         const targetUrl = strategy.fn(url);
-        
         const response = await fetch(targetUrl);
-        
         if (response.ok) {
-          // Kiểm tra Content-Type
           const contentType = response.headers.get('content-type');
-          
-          // Nếu trả về HTML (trang web) -> Ném lỗi để caller biết đường xử lý (trích xuất lại)
-          if (contentType && contentType.includes('text/html')) {
-             throw new Error("IS_HTML_PAGE");
-          }
-
-          return response; // Thành công
-        } else {
-           // Nếu lỗi 403/401 -> Có thể do chặn Hotlink, thử proxy tiếp theo
-           if (response.status === 403 || response.status === 401) {
-             console.warn(`Access denied via ${strategy.name}`);
-           }
-           throw new Error(`HTTP Error ${response.status}`);
+          if (contentType && contentType.includes('text/html')) throw new Error("IS_HTML_PAGE");
+          return response;
         }
+        throw new Error(`HTTP Error ${response.status}`);
       } catch (err) {
-        // Nếu là lỗi HTML Page thì throw ngay để ra ngoài xử lý extraction
-        if (err instanceof Error && err.message === 'IS_HTML_PAGE') {
-            throw err;
-        }
-        console.warn(`Thất bại qua kênh ${strategy.name}:`, err);
+        if (err instanceof Error && err.message === 'IS_HTML_PAGE') throw err;
         lastError = err;
-        // Tiếp tục thử strategy tiếp theo
       }
     }
-    
     throw lastError || new Error("Không thể kết nối đến file video.");
   };
 
@@ -172,15 +139,10 @@ export default function App() {
       addLog('Vui lòng nhập đường dẫn URL.', 'error');
       return;
     }
-
-    // YÊU CẦU ĐẶC BIỆT: Tự động thêm 'ss' vào link Youtube
-    // Chỉ áp dụng cho domain youtube.com, không áp dụng cho youtu.be nếu không có youtube.com
     if (url.includes('youtube.com') && !url.includes('ssyoutube.com')) {
       url = url.replace('youtube.com', 'ssyoutube.com');
       addLog('Đã tự động chuyển đổi sang link ssYoutube theo yêu cầu.', 'info');
     }
-
-    // Kiểm tra sơ bộ xem có phải link mạng xã hội không (bao gồm cả ssyoutube)
     const isSocialLink = /youtube\.com|youtu\.be|facebook\.com|tiktok\.com|instagram\.com|x\.com|twitter\.com|ssyoutube\.com/.test(url);
     
     try {
@@ -191,99 +153,65 @@ export default function App() {
       let targetUrl = url;
       let usedExtraction = false;
 
-      // 1. Nếu là link mạng xã hội, thử trích xuất trước
       if (isSocialLink) {
          try {
-           addLog("Phát hiện link mạng xã hội, đang tự động lấy link gốc...", "info");
            const extractedUrl = await extractSocialVideo(url);
            targetUrl = extractedUrl;
            usedExtraction = true;
            addLog("Đã lấy được link video gốc!", "success");
          } catch (e: any) {
-           // FALLBACK THÔNG MINH:
            if (url.includes('ssyoutube.com')) {
               try {
-                addLog(`Link ssYoutube chưa hỗ trợ trích xuất tự động (${e.message}). Đang thử lại với link Youtube gốc...`, 'warning');
                 const originalUrl = url.replace('ssyoutube.com', 'youtube.com');
-                const extractedUrl = await extractSocialVideo(originalUrl);
-                targetUrl = extractedUrl;
+                targetUrl = await extractSocialVideo(originalUrl);
                 usedExtraction = true;
-                addLog("Thành công với link Youtube gốc!", "success");
-              } catch (fallbackErr: any) {
-                 addLog(`Không thể tự động lấy link: ${fallbackErr.message}. Đang thử tải trực tiếp...`, "error");
-              }
-           } else {
-              addLog(`Không thể tự động lấy link: ${e.message}. Đang thử tải trực tiếp...`, "error");
+              } catch (fallbackErr: any) {}
            }
          }
       }
 
-      // 2. Thực hiện tải file
       let response: Response;
       try {
         response = await fetchWithFallback(targetUrl);
       } catch (e: any) {
         if (e.message === 'IS_HTML_PAGE' && !usedExtraction) {
-            addLog("Link này là trang web, đang thử tìm video bên trong...", "info");
             try {
-                const extractedUrl = await extractSocialVideo(url);
-                targetUrl = extractedUrl;
+                targetUrl = await extractSocialVideo(url);
                 response = await fetchWithFallback(targetUrl);
             } catch (extractErr) {
-                if (url.includes('ssyoutube.com')) {
-                    try {
-                        const originalUrl = url.replace('ssyoutube.com', 'youtube.com');
-                        addLog("Thử lại với cấu hình Youtube chuẩn...", "info");
-                        const extractedUrl = await extractSocialVideo(originalUrl);
-                        targetUrl = extractedUrl;
-                        response = await fetchWithFallback(targetUrl);
-                    } catch (finalErr) {
-                        throw new Error("Không thể trích xuất video từ trang này.");
-                    }
-                } else {
-                    throw new Error("Đây là trang web, không phải file video và hệ thống không tìm thấy video nào.");
-                }
+               if (url.includes('ssyoutube.com')) {
+                   try {
+                       const originalUrl = url.replace('ssyoutube.com', 'youtube.com');
+                       targetUrl = await extractSocialVideo(originalUrl);
+                       response = await fetchWithFallback(targetUrl);
+                   } catch (finalErr) {
+                       throw new Error("Không thể trích xuất video từ trang này.");
+                   }
+               } else {
+                   throw new Error("Không tìm thấy video.");
+               }
             }
-        } else if (e.message === 'IS_HTML_PAGE') {
-             throw new Error("Không thể tải video (Server trả về trang web thay vì file).");
         } else {
              throw e;
         }
       }
 
-      const contentType = response.headers.get('content-type');
-      if (contentType && !contentType.startsWith('video/')) {
-         addLog(`Cảnh báo: File tải về có dạng ${contentType}, có thể không xử lý được.`, 'error');
-      }
-
-      setDownloadProgress('Đang lưu vào bộ nhớ tạm...');
-      
       const blob = await response.blob();
-      
-      if (blob.size < 1000) {
-        throw new Error("File tải về quá nhỏ hoặc bị lỗi.");
-      }
+      if (blob.size < 1000) throw new Error("File tải về quá nhỏ hoặc bị lỗi.");
 
-      // Lấy tên file
       let fileName = `video_${Date.now()}.mp4`;
       try {
         const urlObj = new URL(targetUrl);
         const pathName = urlObj.pathname.split('/').pop();
-        if (pathName && (pathName.endsWith('.mp4') || pathName.endsWith('.mkv'))) {
-          fileName = pathName;
-        }
+        if (pathName && (pathName.endsWith('.mp4') || pathName.endsWith('.mkv'))) fileName = pathName;
       } catch (e) {}
       
-      const file = new File([blob], fileName, { type: blob.type || 'video/mp4' });
-      
-      setVideoFile(file);
-      addLog(`Download thành công! Đã lưu: ${fileName} (${(file.size / (1024 * 1024)).toFixed(2)} MB)`, 'success');
+      setVideoFile(new File([blob], fileName, { type: blob.type || 'video/mp4' }));
+      addLog(`Download thành công! Đã lưu: ${fileName}`, 'success');
       setStatus(AppStatus.IDLE);
       setProgress(0);
       setDownloadProgress('');
-
     } catch (error: any) {
-      console.error(error);
       addLog(`Lỗi download: ${error.message}`, 'error');
       setDownloadProgress('');
     } finally {
@@ -293,61 +221,82 @@ export default function App() {
 
   // Hàm xử lý chọn thư mục lưu (Sử dụng File System Access API)
   const handleSelectOutputFolder = async () => {
-    // 1. Kiểm tra môi trường Secure Context (Bắt buộc cho File System Access API)
+    // Nếu đã ở chế độ fallback, cho phép người dùng thử lại chọn thư mục
+    
+    // Kiểm tra môi trường Secure Context
     if (!window.isSecureContext) {
-      alert("Lỗi: Tính năng chọn thư mục bị chặn do kết nối không an toàn (Not Secure).\nVui lòng chạy ứng dụng trên Localhost hoặc HTTPS.");
-      addLog("Lỗi: Ứng dụng không chạy trong môi trường HTTPS/Localhost.", 'error');
-      return false;
+      addLog("Môi trường không bảo mật (Not Secure). Chuyển sang chế độ Tải xuống Trình duyệt.", 'warning');
+      setIsFallbackMode(true);
+      setOutputDir(null);
+      return true;
     }
 
     try {
-      // 2. Kiểm tra trình duyệt có hỗ trợ không
       // @ts-ignore
-      const showPicker = window.showDirectoryPicker;
-      
-      if (typeof showPicker !== 'function') {
-        alert("Trình duyệt này không hỗ trợ chọn thư mục.\nVui lòng sử dụng Google Chrome, Microsoft Edge hoặc Opera trên máy tính (Desktop).");
-        addLog("Trình duyệt không hỗ trợ File System Access API.", 'error');
-        return false;
+      if (typeof window.showDirectoryPicker !== 'function') {
+        throw new Error("Trình duyệt không hỗ trợ API thư mục.");
       }
 
-      // 3. Gọi API
       // @ts-ignore
       const handle = await window.showDirectoryPicker();
       setOutputDir(handle);
+      setIsFallbackMode(false); // Tắt fallback nếu chọn thành công
       addLog(`Đã chọn thư mục lưu: ${handle.name}`, 'success');
       return true;
     } catch (error: any) {
-      // Bỏ qua lỗi nếu người dùng tự tắt dialog (AbortError)
-      if (error.name !== 'AbortError') {
-        console.error(error);
-        alert(`Không thể mở hộp thoại chọn thư mục: ${error.message}`);
-        addLog(`Lỗi chọn thư mục: ${error.message}`, 'error');
+      // Nếu là lỗi người dùng hủy (AbortError), không làm gì cả
+      if (error.name === 'AbortError') return false;
+
+      // Nếu là lỗi Security hoặc Cross Origin (Iframe) -> Bật Fallback
+      if (error.message.includes('Cross origin') || error.message.includes('Security') || error.name === 'SecurityError') {
+        console.warn("Chuyển sang chế độ Fallback do lỗi bảo mật:", error);
+        setIsFallbackMode(true);
+        setOutputDir(null);
+        addLog("Do hạn chế bảo mật trình duyệt (Iframe), ứng dụng sẽ chuyển sang chế độ Tự động tải xuống.", 'warning');
+        return true; // Coi như thành công để tiếp tục flow
       }
-      return false;
+
+      // Các lỗi khác (ví dụ trình duyệt không hỗ trợ) -> Cũng bật Fallback cho tiện
+      setIsFallbackMode(true);
+      setOutputDir(null);
+      addLog(`Không thể chọn thư mục (${error.message}). Đã chuyển sang chế độ Tự động tải xuống.`, 'warning');
+      return true;
     }
+  };
+
+  // Helper download file cho chế độ fallback
+  const downloadFileBrowser = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
 
   // Hàm bắt đầu xử lý
   const handleStartProcessing = async () => {
-    // 1. Kiểm tra điều kiện đầu vào
     if (!videoFile) {
       addLog('Vui lòng chọn video đầu vào.', 'error');
       return;
     }
     
-    // Tự động nhắc chọn thư mục nếu chưa chọn (UX improvement)
-    if (!outputDir) {
-      addLog('Bạn chưa chọn thư mục đầu ra. Đang mở hộp thoại chọn...', 'warning');
-      const selected = await handleSelectOutputFolder();
-      if (!selected) {
-        addLog('Đã hủy xử lý vì chưa chọn thư mục lưu.', 'error');
-        return;
+    // Nếu chưa chọn thư mục và cũng chưa bật fallback -> Thử chọn thư mục
+    if (!outputDir && !isFallbackMode) {
+      addLog('Bạn chưa chọn nơi lưu. Đang mở hộp thoại...', 'warning');
+      const result = await handleSelectOutputFolder();
+      if (!result && !isFallbackMode) { // Nếu chọn thất bại và không tự bật fallback
+         // Ở đây có thể người dùng hủy, ta nhắc lại
+         addLog('Vui lòng chọn thư mục hoặc chấp nhận chế độ Tải xuống.', 'error');
+         return;
       }
-      // Vì setOutputDir là bất đồng bộ, ta dừng ở đây để người dùng nhấn lại nút Start
-      // hoặc có thể tiếp tục nếu dùng biến cục bộ, nhưng để an toàn và rõ ràng:
-      addLog('Đã chọn xong thư mục. Vui lòng nhấn "Bắt đầu xử lý" một lần nữa.', 'info');
-      return;
+      // Nếu handleSelectOutputFolder trả về true (hoặc đã bật fallback), tiếp tục
+      if (!outputDir && !isFallbackMode) {
+         // Trường hợp hy hữu: handle trả về true nhưng chưa set outputDir và chưa set fallback (không nên xảy ra)
+         return; 
+      }
     }
 
     if (mode === ProcessingMode.CUT_SEGMENTS && segmentSeconds <= 0) {
@@ -355,36 +304,49 @@ export default function App() {
       return;
     }
 
+    if (isFallbackMode && mode === ProcessingMode.EXTRACT_FRAMES) {
+       addLog('Cảnh báo: Chế độ "Trích xuất Frame" sẽ tải xuống rất nhiều file ảnh. Trình duyệt có thể hỏi quyền tải nhiều file.', 'warning');
+    }
+
     try {
       setStatus(AppStatus.LOADING_CORE);
       addLog('Đang khởi động engine xử lý video...');
       
-      // 2. Load FFmpeg
       await ffmpegService.load();
       
       setStatus(AppStatus.PROCESSING);
-      addLog('Bắt đầu xử lý...', 'info');
+      addLog(isFallbackMode ? 'Bắt đầu xử lý (Chế độ Tải xuống)...' : 'Bắt đầu xử lý (Chế độ Lưu file)...', 'info');
 
-      // 3. Thực hiện xử lý theo chế độ
+      // Callback chung cho việc tải file (nếu fallback)
+      const onFileGenerated = (blob: Blob, filename: string) => {
+         downloadFileBrowser(blob, filename);
+      };
+
       if (mode === ProcessingMode.CUT_SEGMENTS) {
         await ffmpegService.cutVideo(
           videoFile,
           segmentSeconds,
-          outputDir,
+          outputDir, // Có thể là null
           (p) => setProgress(p),
-          (msg) => addLog(msg, 'info')
+          (msg) => addLog(msg, 'info'),
+          onFileGenerated
         );
       } else {
         await ffmpegService.extractFrames(
           videoFile,
-          outputDir,
+          outputDir, // Có thể là null
           (p) => setProgress(p),
-          (msg) => addLog(msg, 'info')
+          (msg) => addLog(msg, 'info'),
+          onFileGenerated
         );
       }
 
       setStatus(AppStatus.COMPLETED);
-      addLog('Xử lý hoàn tất! Vui lòng kiểm tra thư mục đã chọn.', 'success');
+      if (isFallbackMode) {
+        addLog('Hoàn tất! Các file đã được gửi lệnh tải xuống.', 'success');
+      } else {
+        addLog('Hoàn tất! Vui lòng kiểm tra thư mục đã chọn.', 'success');
+      }
       setProgress(100);
 
     } catch (error: any) {
@@ -423,7 +385,6 @@ export default function App() {
                 <label className="block text-sm font-semibold text-slate-700">1. Video đầu vào</label>
                 
                 {videoFile ? (
-                   // Trạng thái đã có file (Upload hoặc Download xong)
                    <div className="border-2 border-blue-500 bg-blue-50 rounded-xl p-6 flex flex-col items-center justify-center text-center relative animate-in fade-in duration-300">
                      <button 
                        onClick={resetFile}
@@ -438,9 +399,7 @@ export default function App() {
                      <p className="text-xs text-blue-600 font-medium bg-blue-100 px-2 py-1 rounded-full">Sẵn sàng xử lý</p>
                    </div>
                 ) : (
-                  // Chưa có file: Hiển thị Tabs chọn nguồn
                   <div className="border border-slate-200 rounded-xl overflow-hidden">
-                    {/* Tabs */}
                     <div className="flex border-b border-slate-200 bg-slate-50">
                       <button 
                         onClick={() => setInputType('upload')}
@@ -456,7 +415,6 @@ export default function App() {
                       </button>
                     </div>
 
-                    {/* Content */}
                     <div className="p-4 h-60 flex items-center justify-center">
                       {inputType === 'upload' ? (
                         <div 
@@ -490,14 +448,12 @@ export default function App() {
                               />
                             </div>
                           </div>
-
                           <div className="bg-blue-50 text-blue-700 p-2 rounded text-[11px] flex items-start gap-2">
                              <Wand2 className="w-4 h-4 shrink-0 mt-0.5 text-blue-600" />
                              <p>
-                               <b>Hỗ trợ đa năng:</b> Hệ thống tự động nhận diện và trích xuất video từ Youtube, Facebook, TikTok... (bao gồm cả chế độ ssYoutube).
+                               <b>Hỗ trợ đa năng:</b> Hệ thống tự động nhận diện video từ nhiều nguồn (ssYoutube supported).
                              </p>
                           </div>
-                          
                           <Button 
                             variant="secondary" 
                             onClick={handleUrlDownload}
@@ -519,29 +475,48 @@ export default function App() {
                 )}
               </div>
 
-              {/* Output Folder */}
+              {/* Output Folder / Method */}
               <div className="space-y-3">
-                <label className="block text-sm font-semibold text-slate-700">2. Thư mục đầu ra</label>
-                <button 
-                  type="button"
-                  className={`w-full h-full min-h-[140px] border-2 border-dashed rounded-xl p-6 flex flex-col items-center justify-center text-center transition-colors cursor-pointer hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${outputDir ? 'border-green-500 bg-green-50' : 'border-slate-300'}`}
-                  onClick={handleSelectOutputFolder}
-                >
-                  {outputDir ? (
-                    <>
-                      <FolderOutput className="w-10 h-10 text-green-600 mb-2" />
-                      <p className="font-medium text-slate-900">{outputDir.name}</p>
-                      <p className="text-sm text-slate-500">Đã chọn nơi lưu file</p>
-                      <p className="text-xs text-green-600 mt-1 font-medium bg-green-100 px-2 py-0.5 rounded">Nhấn để thay đổi</p>
-                    </>
-                  ) : (
-                    <>
-                      <FolderOutput className="w-10 h-10 text-slate-400 mb-2" />
-                      <p className="font-medium text-slate-600">Chọn thư mục lưu</p>
-                      <p className="text-sm text-slate-400">Nơi chứa file sau khi cắt/trích xuất</p>
-                    </>
-                  )}
-                </button>
+                <label className="block text-sm font-semibold text-slate-700">2. Phương thức lưu</label>
+                
+                {!isFallbackMode ? (
+                  // Chế độ bình thường: Chọn thư mục
+                  <button 
+                    type="button"
+                    className={`w-full h-full min-h-[140px] border-2 border-dashed rounded-xl p-6 flex flex-col items-center justify-center text-center transition-colors cursor-pointer hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${outputDir ? 'border-green-500 bg-green-50' : 'border-slate-300'}`}
+                    onClick={handleSelectOutputFolder}
+                  >
+                    {outputDir ? (
+                      <>
+                        <FolderOutput className="w-10 h-10 text-green-600 mb-2" />
+                        <p className="font-medium text-slate-900">{outputDir.name}</p>
+                        <p className="text-sm text-slate-500">Đã chọn nơi lưu file</p>
+                        <p className="text-xs text-green-600 mt-1 font-medium bg-green-100 px-2 py-0.5 rounded">Nhấn để thay đổi</p>
+                      </>
+                    ) : (
+                      <>
+                        <FolderOutput className="w-10 h-10 text-slate-400 mb-2" />
+                        <p className="font-medium text-slate-600">Chọn thư mục lưu</p>
+                        <p className="text-sm text-slate-400">Nơi chứa file sau khi cắt/trích xuất</p>
+                      </>
+                    )}
+                  </button>
+                ) : (
+                  // Chế độ Fallback: Tự động tải xuống
+                  <div className="w-full h-full min-h-[140px] border-2 border-orange-200 bg-orange-50 rounded-xl p-6 flex flex-col items-center justify-center text-center">
+                    <HardDrive className="w-10 h-10 text-orange-500 mb-2" />
+                    <p className="font-medium text-slate-900">Chế độ Tải xuống tự động</p>
+                    <p className="text-xs text-slate-600 mt-1 px-2">
+                       Do hạn chế bảo mật trình duyệt, ứng dụng sẽ gửi file cho bạn tải về thay vì lưu trực tiếp.
+                    </p>
+                    <button 
+                      onClick={() => { setIsFallbackMode(false); handleSelectOutputFolder(); }}
+                      className="mt-3 text-xs text-blue-600 underline hover:text-blue-800"
+                    >
+                      Thử chọn lại thư mục
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -612,7 +587,7 @@ export default function App() {
               >
                 {status === AppStatus.IDLE || status === AppStatus.ERROR || status === AppStatus.COMPLETED ? (
                   <>
-                    <Play className="w-5 h-5" /> Bắt đầu xử lý
+                    <Play className="w-5 h-5" /> {isFallbackMode ? 'Bắt đầu xử lý & Tải xuống' : 'Bắt đầu xử lý'}
                   </>
                 ) : (
                   'Đang xử lý...'
