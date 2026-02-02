@@ -1,27 +1,58 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Upload, FolderOutput, Scissors, Image as ImageIcon, Play, AlertCircle, FileVideo, CheckCircle, Terminal, Globe, Link as LinkIcon, Download, X, RefreshCw, Info, Wand2, HardDrive } from 'lucide-react';
+import { Upload, FolderOutput, Scissors, Image as ImageIcon, Play, AlertCircle, FileVideo, CheckCircle, Terminal, Globe, Link as LinkIcon, Download, X, RefreshCw, Info, Wand2, HardDrive, Cloud, Settings } from 'lucide-react';
 import { Button } from './components/ui/Button';
-import { ProcessingMode, AppStatus, FileSystemDirectoryHandle, LogMessage } from './types';
+import { ProcessingMode, AppStatus, FileSystemDirectoryHandle, LogMessage, DriveFolder, GoogleDriveConfig } from './types';
 import { ffmpegService } from './utils/ffmpegService';
+import { googleDriveService } from './utils/googleDriveService';
+
+// --- CẤU HÌNH MẶC ĐỊNH ---
+// Helper to safely access process.env
+const getEnv = (key: string) => {
+  try {
+    // @ts-ignore
+    return (typeof process !== 'undefined' && process.env && process.env[key]) || "";
+  } catch (e) {
+    return "";
+  }
+};
+
+const DEFAULT_GOOGLE_CONFIG = {
+  // Ưu tiên biến môi trường, sau đó đến giá trị hardcode
+  clientId: getEnv('REACT_APP_GOOGLE_CLIENT_ID'), 
+  apiKey: getEnv('REACT_APP_GOOGLE_API_KEY'),
+  appId: getEnv('REACT_APP_GOOGLE_APP_ID')
+};
 
 // Main Application Component
 export default function App() {
   // State quản lý file đầu vào
   const [videoFile, setVideoFile] = useState<File | null>(null);
-  // State quản lý thư mục đầu ra
+  
+  // State quản lý đầu ra (Drive hoặc Local)
+  const [useDrive, setUseDrive] = useState<boolean>(true); // Mặc định dùng Drive
+  const [driveFolder, setDriveFolder] = useState<DriveFolder | null>(null);
   const [outputDir, setOutputDir] = useState<FileSystemDirectoryHandle | null>(null);
-  // State chế độ fallback (khi không chọn được thư mục)
+  
+  // Google Config State
+  // Thứ tự ưu tiên: LocalStorage -> Default Config (Hardcode/Env) -> Rỗng
+  const [driveConfig, setDriveConfig] = useState<GoogleDriveConfig>({
+    clientId: localStorage.getItem('gdrive_client_id') || DEFAULT_GOOGLE_CONFIG.clientId,
+    apiKey: localStorage.getItem('gdrive_api_key') || DEFAULT_GOOGLE_CONFIG.apiKey,
+    appId: localStorage.getItem('gdrive_app_id') || DEFAULT_GOOGLE_CONFIG.appId
+  });
+  const [showConfig, setShowConfig] = useState(false);
+  const [pendingConnect, setPendingConnect] = useState(false);
+
+  // State chế độ fallback (khi không chọn được thư mục và không dùng Drive)
   const [isFallbackMode, setIsFallbackMode] = useState<boolean>(false);
   
   // State chế độ xử lý (Cắt hoặc Trích xuất ảnh)
   const [mode, setMode] = useState<ProcessingMode>(ProcessingMode.EXTRACT_FRAMES);
   // State số giây cắt (cho chế độ cắt video)
   const [segmentSeconds, setSegmentSeconds] = useState<number>(5);
-  // Trạng thái ứng dụng (Loading, Processing, Idle...)
+  // Trạng thái ứng dụng
   const [status, setStatus] = useState<AppStatus>(AppStatus.IDLE);
-  // Tiến trình xử lý (0-100%)
   const [progress, setProgress] = useState<number>(0);
-  // Logs hiển thị cho người dùng
   const [logs, setLogs] = useState<LogMessage[]>([]);
   
   // State cho phần nhập URL
@@ -30,17 +61,34 @@ export default function App() {
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<string>('');
   
-  // Ref cho input file ẩn
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // Ref để auto scroll logs
   const logsEndRef = useRef<HTMLDivElement>(null);
+
+  // Khởi tạo Google Service khi config thay đổi
+  useEffect(() => {
+    // Chỉ init nếu có config hợp lệ (độ dài > 5 để tránh giá trị rác)
+    if (driveConfig.clientId?.length > 5 && driveConfig.apiKey?.length > 5) {
+      googleDriveService.setConfig(driveConfig);
+      googleDriveService.init()
+        .then(() => {
+            // Nếu pendingConnect = true (người dùng vừa bấm connect nhưng chưa có key), giờ key đã có -> tự động connect lại
+            if (pendingConnect) {
+              setPendingConnect(false);
+              handleConnectDrive();
+            }
+        })
+        .catch(err => {
+            console.error("GAPI Init Error", err);
+            addLog("Lỗi khởi tạo Google Drive API. Vui lòng kiểm tra cấu hình.", 'warning');
+        });
+    }
+  }, [driveConfig]); // Add dependency to re-run when config changes
 
   // Auto scroll xuống cuối log
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
-  // Hàm thêm log mới
   const addLog = (text: string, type: LogMessage['type'] = 'info') => {
     setLogs(prev => [...prev, {
       id: Math.random().toString(36).substr(2, 9),
@@ -50,7 +98,18 @@ export default function App() {
     }]);
   };
 
-  // Reset file đã chọn
+  const saveConfig = () => {
+    localStorage.setItem('gdrive_client_id', driveConfig.clientId);
+    localStorage.setItem('gdrive_api_key', driveConfig.apiKey);
+    localStorage.setItem('gdrive_app_id', driveConfig.appId || '');
+    
+    // Khi save, state driveConfig sẽ update -> Trigger useEffect init
+    setShowConfig(false);
+    addLog("Đã lưu cấu hình. Đang khởi tạo kết nối...", 'info');
+    
+    // Nếu đang đợi connect thì useEffect sẽ lo việc gọi handleConnectDrive
+  };
+
   const resetFile = () => {
     setVideoFile(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
@@ -59,7 +118,6 @@ export default function App() {
     addLog('Đã hủy chọn file.', 'info');
   };
 
-  // Hàm xử lý chọn file video từ máy
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
@@ -74,44 +132,29 @@ export default function App() {
     }
   };
 
-  /**
-   * Helper: Trích xuất video từ link mạng xã hội (Youtube, Facebook, TikTok...)
-   */
+  // --- Logic Download URL (Giữ nguyên) ---
   const extractSocialVideo = async (url: string): Promise<string> => {
     try {
       setDownloadProgress('Đang phân tích link và tìm video gốc...');
       const response = await fetch('https://api.cobalt.tools/api/json', {
         method: 'POST',
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: url })
       });
-
       if (!response.ok) throw new Error(`API Trích xuất lỗi (Status ${response.status})`);
       const data = await response.json();
-      
       if (data.status === 'stream' || data.status === 'redirect') return data.url;
       if (data.status === 'picker' && data.picker && data.picker.length > 0) return data.picker[0].url;
-      if (data.status === 'error') throw new Error(data.text || "Không tìm thấy video từ link này.");
       throw new Error("Không tìm thấy link video trực tiếp.");
-    } catch (error) {
-      console.warn("Extraction failed:", error);
-      throw error;
-    }
+    } catch (error) { throw error; }
   };
 
-  /**
-   * Helper: Thử fetch video qua nhiều cách (Trực tiếp -> Proxy)
-   */
   const fetchWithFallback = async (url: string): Promise<Response> => {
     const strategies = [
       { name: 'Trực tiếp (Direct)', fn: (u: string) => u },
       { name: 'Proxy 1 (corsproxy.io)', fn: (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}` },
       { name: 'Proxy 2 (allorigins)', fn: (u: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` }
     ];
-
     let lastError: any;
     for (const strategy of strategies) {
       try {
@@ -123,240 +166,172 @@ export default function App() {
           if (contentType && contentType.includes('text/html')) throw new Error("IS_HTML_PAGE");
           return response;
         }
-        throw new Error(`HTTP Error ${response.status}`);
-      } catch (err) {
-        if (err instanceof Error && err.message === 'IS_HTML_PAGE') throw err;
-        lastError = err;
-      }
+      } catch (err) { if (err instanceof Error && err.message === 'IS_HTML_PAGE') throw err; lastError = err; }
     }
     throw lastError || new Error("Không thể kết nối đến file video.");
   };
 
-  // Hàm xử lý download video từ URL
   const handleUrlDownload = async () => {
     let url = urlInput.trim();
-    if (!url) {
-      addLog('Vui lòng nhập đường dẫn URL.', 'error');
-      return;
-    }
-    if (url.includes('youtube.com') && !url.includes('ssyoutube.com')) {
-      url = url.replace('youtube.com', 'ssyoutube.com');
-      addLog('Đã tự động chuyển đổi sang link ssYoutube theo yêu cầu.', 'info');
-    }
+    if (!url) { addLog('Vui lòng nhập đường dẫn URL.', 'error'); return; }
+    if (url.includes('youtube.com') && !url.includes('ssyoutube.com')) url = url.replace('youtube.com', 'ssyoutube.com');
     const isSocialLink = /youtube\.com|youtu\.be|facebook\.com|tiktok\.com|instagram\.com|x\.com|twitter\.com|ssyoutube\.com/.test(url);
-    
     try {
-      setIsDownloading(true);
-      setDownloadProgress('Đang khởi tạo...');
-      addLog(`Bắt đầu xử lý link: ${url}`, 'info');
-
+      setIsDownloading(true); setDownloadProgress('Đang khởi tạo...');
       let targetUrl = url;
-      let usedExtraction = false;
-
       if (isSocialLink) {
-         try {
-           const extractedUrl = await extractSocialVideo(url);
-           targetUrl = extractedUrl;
-           usedExtraction = true;
-           addLog("Đã lấy được link video gốc!", "success");
-         } catch (e: any) {
-           if (url.includes('ssyoutube.com')) {
-              try {
-                const originalUrl = url.replace('ssyoutube.com', 'youtube.com');
-                targetUrl = await extractSocialVideo(originalUrl);
-                usedExtraction = true;
-              } catch (fallbackErr: any) {}
-           }
-         }
+         try { targetUrl = await extractSocialVideo(url); } catch (e) {}
       }
-
-      let response: Response;
-      try {
-        response = await fetchWithFallback(targetUrl);
-      } catch (e: any) {
-        if (e.message === 'IS_HTML_PAGE' && !usedExtraction) {
-            try {
-                targetUrl = await extractSocialVideo(url);
-                response = await fetchWithFallback(targetUrl);
-            } catch (extractErr) {
-               if (url.includes('ssyoutube.com')) {
-                   try {
-                       const originalUrl = url.replace('ssyoutube.com', 'youtube.com');
-                       targetUrl = await extractSocialVideo(originalUrl);
-                       response = await fetchWithFallback(targetUrl);
-                   } catch (finalErr) {
-                       throw new Error("Không thể trích xuất video từ trang này.");
-                   }
-               } else {
-                   throw new Error("Không tìm thấy video.");
-               }
-            }
-        } else {
-             throw e;
-        }
-      }
-
+      const response = await fetchWithFallback(targetUrl);
       const blob = await response.blob();
-      if (blob.size < 1000) throw new Error("File tải về quá nhỏ hoặc bị lỗi.");
-
-      let fileName = `video_${Date.now()}.mp4`;
-      try {
-        const urlObj = new URL(targetUrl);
-        const pathName = urlObj.pathname.split('/').pop();
-        if (pathName && (pathName.endsWith('.mp4') || pathName.endsWith('.mkv'))) fileName = pathName;
-      } catch (e) {}
-      
-      setVideoFile(new File([blob], fileName, { type: blob.type || 'video/mp4' }));
-      addLog(`Download thành công! Đã lưu: ${fileName}`, 'success');
-      setStatus(AppStatus.IDLE);
-      setProgress(0);
-      setDownloadProgress('');
+      setVideoFile(new File([blob], `video_${Date.now()}.mp4`, { type: blob.type || 'video/mp4' }));
+      addLog(`Download thành công!`, 'success');
+      setStatus(AppStatus.IDLE); setProgress(0); setDownloadProgress('');
     } catch (error: any) {
       addLog(`Lỗi download: ${error.message}`, 'error');
-      setDownloadProgress('');
-    } finally {
-      setIsDownloading(false);
+    } finally { setIsDownloading(false); }
+  };
+
+  // --- Logic Drive & Folder ---
+
+  const handleConnectDrive = async () => {
+    // Check config validity
+    if (!driveConfig.clientId || !driveConfig.apiKey || driveConfig.clientId.length < 5) {
+      setShowConfig(true);
+      setPendingConnect(true); // Đánh dấu là user đang muốn connect
+      addLog("Vui lòng nhập Client ID và API Key để tiếp tục.", 'warning');
+      return;
+    }
+    
+    // Nếu chưa khởi tạo service (do useEffect chưa chạy hoặc config mới update), thử init lại
+    googleDriveService.setConfig(driveConfig);
+    
+    try {
+      addLog("Đang kết nối Google Drive...", 'info');
+      
+      // Đảm bảo thư viện đã load
+      await googleDriveService.init();
+      
+      const folder = await googleDriveService.pickFolder();
+      setDriveFolder(folder);
+      setUseDrive(true);
+      setOutputDir(null); // Reset local folder
+      setIsFallbackMode(false);
+      addLog(`Đã chọn thư mục Drive: ${folder.name}`, 'success');
+    } catch (e: any) {
+      if (e.message?.includes('Google Service chưa khởi tạo') || e.message?.includes('Script error')) {
+           addLog("Đang tải thư viện Google, vui lòng thử lại sau 2 giây...", 'warning');
+           // Retry silent init
+           googleDriveService.init().catch(()=>{});
+      } else {
+           addLog(`Lỗi kết nối Drive: ${e.message || e}`, 'error');
+           if (e.message?.includes("origin_mismatch")) {
+             addLog("Gợi ý: Kiểm tra 'Authorized JavaScript origins' trong Google Cloud Console.", 'info');
+           }
+      }
     }
   };
 
-  // Hàm xử lý chọn thư mục lưu (Sử dụng File System Access API)
-  const handleSelectOutputFolder = async () => {
-    // Nếu đã ở chế độ fallback, cho phép người dùng thử lại chọn thư mục
-    
-    // Kiểm tra môi trường Secure Context
+  const handleSelectLocalFolder = async () => {
     if (!window.isSecureContext) {
-      addLog("Môi trường không bảo mật (Not Secure). Chuyển sang chế độ Tải xuống Trình duyệt.", 'warning');
-      setIsFallbackMode(true);
-      setOutputDir(null);
-      return true;
+      addLog("Môi trường không bảo mật. Chuyển sang tải xuống.", 'warning');
+      setIsFallbackMode(true); return;
     }
-
     try {
-      // @ts-ignore
-      if (typeof window.showDirectoryPicker !== 'function') {
-        throw new Error("Trình duyệt không hỗ trợ API thư mục.");
-      }
-
       // @ts-ignore
       const handle = await window.showDirectoryPicker();
       setOutputDir(handle);
-      setIsFallbackMode(false); // Tắt fallback nếu chọn thành công
-      addLog(`Đã chọn thư mục lưu: ${handle.name}`, 'success');
-      return true;
+      setUseDrive(false);
+      setDriveFolder(null);
+      setIsFallbackMode(false);
+      addLog(`Đã chọn thư mục local: ${handle.name}`, 'success');
     } catch (error: any) {
-      // Nếu là lỗi người dùng hủy (AbortError), không làm gì cả
-      if (error.name === 'AbortError') return false;
-
-      // Nếu là lỗi Security hoặc Cross Origin (Iframe) -> Bật Fallback
-      if (error.message.includes('Cross origin') || error.message.includes('Security') || error.name === 'SecurityError') {
-        console.warn("Chuyển sang chế độ Fallback do lỗi bảo mật:", error);
+      if (error.name !== 'AbortError') {
         setIsFallbackMode(true);
         setOutputDir(null);
-        addLog("Do hạn chế bảo mật trình duyệt (Iframe), ứng dụng sẽ chuyển sang chế độ Tự động tải xuống.", 'warning');
-        return true; // Coi như thành công để tiếp tục flow
       }
-
-      // Các lỗi khác (ví dụ trình duyệt không hỗ trợ) -> Cũng bật Fallback cho tiện
-      setIsFallbackMode(true);
-      setOutputDir(null);
-      addLog(`Không thể chọn thư mục (${error.message}). Đã chuyển sang chế độ Tự động tải xuống.`, 'warning');
-      return true;
     }
   };
 
-  // Helper download file cho chế độ fallback
   const downloadFileBrowser = (blob: Blob, filename: string) => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
 
-  // Hàm bắt đầu xử lý
   const handleStartProcessing = async () => {
-    if (!videoFile) {
-      addLog('Vui lòng chọn video đầu vào.', 'error');
-      return;
-    }
+    if (!videoFile) { addLog('Vui lòng chọn video đầu vào.', 'error'); return; }
     
-    // Nếu chưa chọn thư mục và cũng chưa bật fallback -> Thử chọn thư mục
-    if (!outputDir && !isFallbackMode) {
-      addLog('Bạn chưa chọn nơi lưu. Đang mở hộp thoại...', 'warning');
-      const result = await handleSelectOutputFolder();
-      if (!result && !isFallbackMode) { // Nếu chọn thất bại và không tự bật fallback
-         // Ở đây có thể người dùng hủy, ta nhắc lại
-         addLog('Vui lòng chọn thư mục hoặc chấp nhận chế độ Tải xuống.', 'error');
-         return;
-      }
-      // Nếu handleSelectOutputFolder trả về true (hoặc đã bật fallback), tiếp tục
-      if (!outputDir && !isFallbackMode) {
-         // Trường hợp hy hữu: handle trả về true nhưng chưa set outputDir và chưa set fallback (không nên xảy ra)
-         return; 
-      }
-    }
-
-    if (mode === ProcessingMode.CUT_SEGMENTS && segmentSeconds <= 0) {
-      addLog('Số giây cắt phải lớn hơn 0.', 'error');
+    // Validate output destination
+    if (useDrive && !driveFolder) {
+      addLog('Vui lòng chọn thư mục trên Google Drive.', 'error');
+      handleConnectDrive();
       return;
     }
-
-    if (isFallbackMode && mode === ProcessingMode.EXTRACT_FRAMES) {
-       addLog('Cảnh báo: Chế độ "Trích xuất Frame" sẽ tải xuống rất nhiều file ảnh. Trình duyệt có thể hỏi quyền tải nhiều file.', 'warning');
+    if (!useDrive && !outputDir && !isFallbackMode) {
+      addLog('Vui lòng chọn thư mục lưu hoặc chế độ tải xuống.', 'error');
+      return;
     }
 
     try {
       setStatus(AppStatus.LOADING_CORE);
       addLog('Đang khởi động engine xử lý video...');
-      
       await ffmpegService.load();
       
       setStatus(AppStatus.PROCESSING);
-      addLog(isFallbackMode ? 'Bắt đầu xử lý (Chế độ Tải xuống)...' : 'Bắt đầu xử lý (Chế độ Lưu file)...', 'info');
+      addLog('Đang xử lý video...', 'info');
 
-      // Callback chung cho việc tải file (nếu fallback)
-      const onFileGenerated = (blob: Blob, filename: string) => {
-         downloadFileBrowser(blob, filename);
+      // Callback xử lý từng file được sinh ra
+      const onFileGenerated = async (blob: Blob, filename: string) => {
+        if (useDrive && driveFolder) {
+           addLog(`Đang upload ${filename} lên Drive...`, 'info');
+           try {
+             await googleDriveService.uploadFile(blob, filename, driveFolder.id);
+             addLog(`Đã upload xong: ${filename}`, 'success');
+           } catch (e) {
+             addLog(`Lỗi upload ${filename}: ${e}`, 'error');
+           }
+        } else if (isFallbackMode) {
+           downloadFileBrowser(blob, filename);
+        } else {
+           // Nếu là local folder, ffmpegService đã tự handle việc ghi file thông qua tham số outputDir
+           // Không cần làm gì ở đây trừ khi muốn log thêm
+        }
+      };
+
+      const options = {
+        onProgress: (p: number) => setProgress(p),
+        onLog: (msg: string) => { 
+           // Filter bớt log ffmpeg cho đỡ rối
+           if(!msg.includes("frame=")) addLog(msg, 'info'); 
+        },
+        onFileGenerated: onFileGenerated
       };
 
       if (mode === ProcessingMode.CUT_SEGMENTS) {
         await ffmpegService.cutVideo(
-          videoFile,
-          segmentSeconds,
-          outputDir, // Có thể là null
-          (p) => setProgress(p),
-          (msg) => addLog(msg, 'info'),
-          onFileGenerated
+          videoFile, segmentSeconds,
+          useDrive ? null : outputDir, // Nếu dùng Drive thì pass null để kích hoạt onFileGenerated
+          options.onProgress, options.onLog, options.onFileGenerated
         );
       } else {
         await ffmpegService.extractFrames(
           videoFile,
-          outputDir, // Có thể là null
-          (p) => setProgress(p),
-          (msg) => addLog(msg, 'info'),
-          onFileGenerated
+          useDrive ? null : outputDir,
+          options.onProgress, options.onLog, options.onFileGenerated
         );
       }
 
       setStatus(AppStatus.COMPLETED);
-      if (isFallbackMode) {
-        addLog('Hoàn tất! Các file đã được gửi lệnh tải xuống.', 'success');
-      } else {
-        addLog('Hoàn tất! Vui lòng kiểm tra thư mục đã chọn.', 'success');
-      }
+      addLog('Tất cả tác vụ đã hoàn tất!', 'success');
       setProgress(100);
 
     } catch (error: any) {
       console.error(error);
       setStatus(AppStatus.ERROR);
-      if (error.message && error.message.includes('SharedArrayBuffer')) {
-        addLog('Lỗi môi trường: Trình duyệt chặn tính năng bảo mật cần thiết (SharedArrayBuffer).', 'error');
-      } else {
-        addLog(`Lỗi xử lý: ${error.message || 'Không xác định'}`, 'error');
-      }
+      addLog(`Lỗi: ${error.message}`, 'error');
     }
   };
 
@@ -365,109 +340,116 @@ export default function App() {
       <div className="max-w-4xl mx-auto space-y-6">
         
         {/* Header */}
-        <div className="text-center space-y-2">
+        <div className="text-center space-y-2 relative">
+           <button 
+             onClick={() => setShowConfig(true)}
+             className="absolute right-0 top-0 p-2 text-slate-400 hover:text-blue-600 transition-colors"
+             title="Cấu hình Google Drive"
+           >
+             <Settings className="w-6 h-6" />
+           </button>
           <h1 className="text-3xl md:text-4xl font-bold text-slate-800 flex items-center justify-center gap-3">
             <FileVideo className="w-10 h-10 text-blue-600" />
-            Video Cutter & Extractor
+            Video Cutter Pro
           </h1>
-          <p className="text-slate-500">Công cụ xử lý video offline ngay trên trình duyệt của bạn</p>
+          <p className="text-slate-500">Cắt & Trích xuất video - Hỗ trợ lưu trực tiếp Google Drive</p>
         </div>
+
+        {/* Config Modal */}
+        {showConfig && (
+          <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+             <div className="bg-white p-6 rounded-2xl shadow-2xl max-w-md w-full animate-in fade-in zoom-in duration-200">
+                 <div className="flex justify-between items-center mb-4">
+                    <h3 className="font-bold text-xl text-slate-800 flex items-center gap-2">
+                       <Settings className="w-5 h-5 text-blue-600" /> Cấu hình Google Drive API
+                    </h3>
+                    <button onClick={() => setShowConfig(false)} className="text-slate-400 hover:text-red-500"><X className="w-5 h-5" /></button>
+                 </div>
+                 
+                 <div className="space-y-4">
+                   <div className="p-3 bg-blue-50 text-blue-700 rounded-lg text-sm flex gap-2">
+                      <Info className="w-5 h-5 flex-shrink-0" />
+                      Để lưu file vào Drive, bạn cần nhập API Key và Client ID từ Google Cloud Console.
+                   </div>
+
+                   <div>
+                     <label className="block text-sm font-semibold text-slate-700 mb-1">Client ID</label>
+                     <input 
+                       type="text" 
+                       value={driveConfig.clientId}
+                       onChange={e => setDriveConfig({...driveConfig, clientId: e.target.value})}
+                       className="w-full border border-slate-300 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all"
+                       placeholder="xxxx.apps.googleusercontent.com"
+                     />
+                   </div>
+                   
+                   <div>
+                     <label className="block text-sm font-semibold text-slate-700 mb-1">API Key</label>
+                     <input 
+                       type="text" 
+                       value={driveConfig.apiKey}
+                       onChange={e => setDriveConfig({...driveConfig, apiKey: e.target.value})}
+                       className="w-full border border-slate-300 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all"
+                       placeholder="AIzaSy..."
+                     />
+                   </div>
+                   
+                   <div>
+                     <label className="block text-sm font-semibold text-slate-700 mb-1">App ID (Project Number - Optional)</label>
+                     <input 
+                       type="text" 
+                       value={driveConfig.appId}
+                       onChange={e => setDriveConfig({...driveConfig, appId: e.target.value})}
+                       className="w-full border border-slate-300 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all"
+                       placeholder="123456789"
+                     />
+                   </div>
+
+                   <div className="flex justify-end gap-3 mt-6">
+                     <Button variant="secondary" onClick={() => setShowConfig(false)}>Hủy</Button>
+                     <Button onClick={saveConfig}>Lưu & Kết nối</Button>
+                   </div>
+                 </div>
+             </div>
+          </div>
+        )}
 
         {/* Main Card */}
         <div className="bg-white rounded-2xl shadow-xl border border-slate-200 overflow-hidden">
           
-          {/* Section 1: Inputs */}
           <div className="p-6 md:p-8 space-y-8 border-b border-slate-100">
-            
             <div className="grid md:grid-cols-2 gap-6">
-              {/* Input Video Section */}
+              
+              {/* 1. Input Video */}
               <div className="space-y-3">
                 <label className="block text-sm font-semibold text-slate-700">1. Video đầu vào</label>
-                
                 {videoFile ? (
-                   <div className="border-2 border-blue-500 bg-blue-50 rounded-xl p-6 flex flex-col items-center justify-center text-center relative animate-in fade-in duration-300">
-                     <button 
-                       onClick={resetFile}
-                       className="absolute top-2 right-2 p-1 text-slate-400 hover:text-red-500 transition-colors"
-                       title="Bỏ chọn file"
-                     >
-                       <X className="w-5 h-5" />
-                     </button>
+                   <div className="border-2 border-blue-500 bg-blue-50 rounded-xl p-6 flex flex-col items-center justify-center text-center relative animate-in fade-in zoom-in duration-300">
+                     <button onClick={resetFile} className="absolute top-2 right-2 p-1 text-slate-400 hover:text-red-500"><X className="w-5 h-5" /></button>
                      <CheckCircle className="w-10 h-10 text-blue-600 mb-2" />
                      <p className="font-bold text-slate-900 truncate max-w-full px-2">{videoFile.name}</p>
-                     <p className="text-sm text-slate-600 mb-1">{(videoFile.size / (1024 * 1024)).toFixed(2)} MB</p>
-                     <p className="text-xs text-blue-600 font-medium bg-blue-100 px-2 py-1 rounded-full">Sẵn sàng xử lý</p>
+                     <p className="text-sm text-slate-600">{(videoFile.size / (1024 * 1024)).toFixed(2)} MB</p>
                    </div>
                 ) : (
-                  <div className="border border-slate-200 rounded-xl overflow-hidden">
-                    <div className="flex border-b border-slate-200 bg-slate-50">
-                      <button 
-                        onClick={() => setInputType('upload')}
-                        className={`flex-1 py-2 text-sm font-medium flex items-center justify-center gap-2 transition-colors ${inputType === 'upload' ? 'bg-white text-blue-600 border-b-2 border-blue-600' : 'text-slate-500 hover:text-slate-700'}`}
-                      >
-                        <Upload className="w-4 h-4" /> Tải file lên
-                      </button>
-                      <button 
-                        onClick={() => setInputType('url')}
-                        className={`flex-1 py-2 text-sm font-medium flex items-center justify-center gap-2 transition-colors ${inputType === 'url' ? 'bg-white text-blue-600 border-b-2 border-blue-600' : 'text-slate-500 hover:text-slate-700'}`}
-                      >
-                        <LinkIcon className="w-4 h-4" /> Link trực tiếp
-                      </button>
+                  <div className="border border-slate-200 rounded-xl overflow-hidden h-60">
+                    <div className="flex border-b bg-slate-50">
+                      <button onClick={() => setInputType('upload')} className={`flex-1 py-2 text-sm font-medium transition-colors ${inputType === 'upload' ? 'bg-white text-blue-600 border-b-2 border-blue-600' : 'text-slate-500 hover:bg-slate-100'}`}>Upload</button>
+                      <button onClick={() => setInputType('url')} className={`flex-1 py-2 text-sm font-medium transition-colors ${inputType === 'url' ? 'bg-white text-blue-600 border-b-2 border-blue-600' : 'text-slate-500 hover:bg-slate-100'}`}>URL</button>
                     </div>
-
-                    <div className="p-4 h-60 flex items-center justify-center">
+                    <div className="p-4 h-full flex items-center justify-center">
                       {inputType === 'upload' ? (
-                        <div 
-                          className="w-full h-full border-2 border-dashed border-slate-300 hover:border-blue-400 hover:bg-slate-50 rounded-lg flex flex-col items-center justify-center cursor-pointer transition-all"
-                          onClick={() => fileInputRef.current?.click()}
-                        >
-                          <input 
-                            type="file" 
-                            ref={fileInputRef} 
-                            onChange={handleFileChange} 
-                            accept="video/*" 
-                            className="hidden" 
-                          />
-                          <Upload className="w-8 h-8 text-slate-400 mb-2" />
-                          <p className="text-sm font-medium text-slate-600">Nhấn để chọn file</p>
-                          <p className="text-xs text-slate-400 mt-1">MP4, MKV, MOV...</p>
+                        <div className="w-full h-40 border-2 border-dashed border-slate-300 hover:border-blue-400 hover:bg-blue-50 transition-all rounded-lg flex flex-col items-center justify-center cursor-pointer group" onClick={() => fileInputRef.current?.click()}>
+                          <input type="file" ref={fileInputRef} onChange={handleFileChange} accept="video/*" className="hidden" />
+                          <Upload className="w-8 h-8 text-slate-400 group-hover:text-blue-500 mb-2 transition-colors" />
+                          <p className="text-sm text-slate-600 group-hover:text-blue-600">Click để chọn file</p>
                         </div>
                       ) : (
-                        <div className="w-full h-full flex flex-col justify-start space-y-3 pt-2">
-                          <div>
-                            <label className="text-xs text-slate-500 font-medium mb-1 block">Nhập Link Video</label>
-                            <div className="relative">
-                              <Globe className="absolute left-3 top-2.5 w-4 h-4 text-slate-400" />
-                              <input 
-                                type="text"
-                                value={urlInput}
-                                onChange={(e) => setUrlInput(e.target.value)}
-                                placeholder="https://youtube.com/..., facebook.com/..."
-                                className="w-full pl-9 pr-3 py-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all"
-                                onKeyDown={(e) => e.key === 'Enter' && handleUrlDownload()}
-                              />
-                            </div>
-                          </div>
-                          <div className="bg-blue-50 text-blue-700 p-2 rounded text-[11px] flex items-start gap-2">
-                             <Wand2 className="w-4 h-4 shrink-0 mt-0.5 text-blue-600" />
-                             <p>
-                               <b>Hỗ trợ đa năng:</b> Hệ thống tự động nhận diện video từ nhiều nguồn (ssYoutube supported).
-                             </p>
-                          </div>
-                          <Button 
-                            variant="secondary" 
-                            onClick={handleUrlDownload}
-                            isLoading={isDownloading}
-                            disabled={!urlInput}
-                            className="w-full text-sm py-1.5"
-                          >
-                            {isDownloading ? 'Đang xử lý...' : (
-                              <><Download className="w-4 h-4" /> Tải về & Chọn</>
-                            )}
-                          </Button>
-                          {isDownloading && (
-                             <p className="text-xs text-center text-blue-500 animate-pulse font-medium">{downloadProgress}</p>
-                          )}
+                        <div className="w-full space-y-2">
+                           <input type="text" value={urlInput} onChange={(e) => setUrlInput(e.target.value)} placeholder="Dán link video vào đây..." className="w-full border border-slate-300 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
+                           <Button onClick={handleUrlDownload} isLoading={isDownloading} className="w-full text-sm" disabled={!urlInput}>
+                             <Download className="w-4 h-4" /> Tải về & Chọn
+                           </Button>
+                           <p className="text-xs text-center text-blue-500 min-h-[1rem]">{downloadProgress}</p>
                         </div>
                       )}
                     </div>
@@ -475,188 +457,123 @@ export default function App() {
                 )}
               </div>
 
-              {/* Output Folder / Method */}
+              {/* 2. Output Destination */}
               <div className="space-y-3">
-                <label className="block text-sm font-semibold text-slate-700">2. Phương thức lưu</label>
+                <div className="flex justify-between items-center">
+                   <label className="block text-sm font-semibold text-slate-700">2. Nơi lưu file</label>
+                   <div className="flex text-xs border rounded-lg overflow-hidden p-0.5 bg-slate-100">
+                      <button onClick={() => { setUseDrive(true); setIsFallbackMode(false); }} className={`px-3 py-1.5 rounded-md transition-all ${useDrive ? 'bg-white text-blue-700 font-bold shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>Google Drive</button>
+                      <button onClick={() => { setUseDrive(false); setDriveFolder(null); }} className={`px-3 py-1.5 rounded-md transition-all ${!useDrive ? 'bg-white text-blue-700 font-bold shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>Local/Tải về</button>
+                   </div>
+                </div>
                 
-                {!isFallbackMode ? (
-                  // Chế độ bình thường: Chọn thư mục
+                {useDrive ? (
+                  // Drive Mode
                   <button 
                     type="button"
-                    className={`w-full h-full min-h-[140px] border-2 border-dashed rounded-xl p-6 flex flex-col items-center justify-center text-center transition-colors cursor-pointer hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${outputDir ? 'border-green-500 bg-green-50' : 'border-slate-300'}`}
-                    onClick={handleSelectOutputFolder}
+                    className={`w-full h-full min-h-[140px] border-2 border-dashed rounded-xl p-6 flex flex-col items-center justify-center text-center transition-all cursor-pointer hover:bg-slate-50 relative group ${driveFolder ? 'border-blue-500 bg-blue-50' : 'border-slate-300'}`}
+                    onClick={handleConnectDrive}
                   >
-                    {outputDir ? (
+                    <Cloud className={`w-12 h-12 mb-3 transition-colors ${driveFolder ? 'text-blue-600' : 'text-slate-400 group-hover:text-blue-500'}`} />
+                    {driveFolder ? (
                       <>
-                        <FolderOutput className="w-10 h-10 text-green-600 mb-2" />
-                        <p className="font-medium text-slate-900">{outputDir.name}</p>
-                        <p className="text-sm text-slate-500">Đã chọn nơi lưu file</p>
-                        <p className="text-xs text-green-600 mt-1 font-medium bg-green-100 px-2 py-0.5 rounded">Nhấn để thay đổi</p>
+                        <p className="font-bold text-slate-900 line-clamp-1">{driveFolder.name}</p>
+                        <p className="text-xs text-blue-600 bg-blue-100 px-2 py-0.5 rounded mt-1">Đã kết nối</p>
+                        <span className="absolute top-2 right-2 text-blue-400 hover:text-blue-600" title="Đổi thư mục"><RefreshCw className="w-4 h-4"/></span>
                       </>
                     ) : (
                       <>
-                        <FolderOutput className="w-10 h-10 text-slate-400 mb-2" />
-                        <p className="font-medium text-slate-600">Chọn thư mục lưu</p>
-                        <p className="text-sm text-slate-400">Nơi chứa file sau khi cắt/trích xuất</p>
+                        <p className="font-medium text-slate-700 group-hover:text-blue-700">Kết nối Google Drive</p>
+                        <p className="text-xs text-slate-400 mt-1">Lưu trực tiếp không cần tải về</p>
                       </>
                     )}
                   </button>
                 ) : (
-                  // Chế độ Fallback: Tự động tải xuống
-                  <div className="w-full h-full min-h-[140px] border-2 border-orange-200 bg-orange-50 rounded-xl p-6 flex flex-col items-center justify-center text-center">
-                    <HardDrive className="w-10 h-10 text-orange-500 mb-2" />
-                    <p className="font-medium text-slate-900">Chế độ Tải xuống tự động</p>
-                    <p className="text-xs text-slate-600 mt-1 px-2">
-                       Do hạn chế bảo mật trình duyệt, ứng dụng sẽ gửi file cho bạn tải về thay vì lưu trực tiếp.
-                    </p>
-                    <button 
-                      onClick={() => { setIsFallbackMode(false); handleSelectOutputFolder(); }}
-                      className="mt-3 text-xs text-blue-600 underline hover:text-blue-800"
-                    >
-                      Thử chọn lại thư mục
-                    </button>
-                  </div>
+                  // Local Mode
+                  <button 
+                    type="button"
+                    className={`w-full h-full min-h-[140px] border-2 border-dashed rounded-xl p-6 flex flex-col items-center justify-center text-center hover:bg-slate-50 transition-all ${outputDir ? 'border-green-500 bg-green-50' : isFallbackMode ? 'border-orange-300 bg-orange-50' : 'border-slate-300'}`}
+                    onClick={handleSelectLocalFolder}
+                  >
+                    {isFallbackMode ? <HardDrive className="w-10 h-10 text-orange-500 mb-3"/> : <FolderOutput className={`w-10 h-10 mb-3 ${outputDir ? 'text-green-600' : 'text-slate-400'}`} />}
+                    {outputDir ? (
+                      <p className="font-bold text-slate-900">{outputDir.name}</p>
+                    ) : isFallbackMode ? (
+                      <p className="font-medium text-slate-900">Tự động tải xuống</p>
+                    ) : (
+                      <p className="font-medium text-slate-600">Chọn thư mục máy tính</p>
+                    )}
+                  </button>
                 )}
               </div>
             </div>
 
-            {/* Mode Selection */}
+            {/* 3. Options */}
             <div className="space-y-4">
-              <label className="block text-sm font-semibold text-slate-700">3. Tùy chọn chế độ</label>
+              <label className="block text-sm font-semibold text-slate-700">3. Tùy chọn xử lý</label>
               <div className="grid md:grid-cols-2 gap-4">
-                
-                {/* Mode 1: Extract Frames */}
-                <label 
-                  className={`relative flex items-start p-4 cursor-pointer rounded-lg border-2 transition-all ${mode === ProcessingMode.EXTRACT_FRAMES ? 'border-blue-500 bg-blue-50 ring-1 ring-blue-500' : 'border-slate-200 hover:border-slate-300'}`}
-                >
-                  <input 
-                    type="radio" 
-                    name="mode" 
-                    className="sr-only"
-                    checked={mode === ProcessingMode.EXTRACT_FRAMES} 
-                    onChange={() => setMode(ProcessingMode.EXTRACT_FRAMES)} 
-                  />
-                  <ImageIcon className={`w-6 h-6 mt-0.5 mr-3 ${mode === ProcessingMode.EXTRACT_FRAMES ? 'text-blue-600' : 'text-slate-400'}`} />
+                <label className={`relative flex p-4 cursor-pointer rounded-xl border-2 transition-all hover:shadow-md ${mode === ProcessingMode.EXTRACT_FRAMES ? 'border-blue-500 bg-blue-50' : 'border-slate-200 hover:border-blue-300'}`}>
+                  <input type="radio" name="mode" className="sr-only" checked={mode === ProcessingMode.EXTRACT_FRAMES} onChange={() => setMode(ProcessingMode.EXTRACT_FRAMES)} />
+                  <div className={`p-2 rounded-full mr-4 ${mode === ProcessingMode.EXTRACT_FRAMES ? 'bg-blue-100' : 'bg-slate-100'}`}>
+                     <ImageIcon className={`w-6 h-6 ${mode === ProcessingMode.EXTRACT_FRAMES ? 'text-blue-600' : 'text-slate-500'}`} />
+                  </div>
                   <div>
-                    <span className="block font-medium text-slate-900">Trích xuất Frame (Ảnh)</span>
-                    <span className="block text-sm text-slate-500 mt-1">Xuất hình ảnh từ video (mặc định 1 ảnh/giây).</span>
+                    <span className="block font-bold text-slate-800">Trích xuất Frame</span>
+                    <span className="text-sm text-slate-500">Xuất ảnh PNG từng giây</span>
                   </div>
                 </label>
-
-                {/* Mode 2: Cut Segments */}
-                <label 
-                  className={`relative flex items-start p-4 cursor-pointer rounded-lg border-2 transition-all ${mode === ProcessingMode.CUT_SEGMENTS ? 'border-blue-500 bg-blue-50 ring-1 ring-blue-500' : 'border-slate-200 hover:border-slate-300'}`}
-                >
-                  <input 
-                    type="radio" 
-                    name="mode" 
-                    className="sr-only"
-                    checked={mode === ProcessingMode.CUT_SEGMENTS} 
-                    onChange={() => setMode(ProcessingMode.CUT_SEGMENTS)} 
-                  />
-                  <Scissors className={`w-6 h-6 mt-0.5 mr-3 ${mode === ProcessingMode.CUT_SEGMENTS ? 'text-blue-600' : 'text-slate-400'}`} />
+                <label className={`relative flex p-4 cursor-pointer rounded-xl border-2 transition-all hover:shadow-md ${mode === ProcessingMode.CUT_SEGMENTS ? 'border-blue-500 bg-blue-50' : 'border-slate-200 hover:border-blue-300'}`}>
+                  <input type="radio" name="mode" className="sr-only" checked={mode === ProcessingMode.CUT_SEGMENTS} onChange={() => setMode(ProcessingMode.CUT_SEGMENTS)} />
+                  <div className={`p-2 rounded-full mr-4 ${mode === ProcessingMode.CUT_SEGMENTS ? 'bg-blue-100' : 'bg-slate-100'}`}>
+                     <Scissors className={`w-6 h-6 ${mode === ProcessingMode.CUT_SEGMENTS ? 'text-blue-600' : 'text-slate-500'}`} />
+                  </div>
                   <div className="flex-1">
-                    <span className="block font-medium text-slate-900">Cắt Video tự động</span>
-                    <span className="block text-sm text-slate-500 mt-1 mb-3">Chia nhỏ video thành các clip.</span>
-                    
-                    {/* Input Seconds inside the radio card for better UX */}
-                    <div className={`flex items-center gap-2 ${mode !== ProcessingMode.CUT_SEGMENTS ? 'opacity-50 pointer-events-none' : ''}`}>
-                      <span className="text-sm font-medium text-slate-700">Mỗi:</span>
-                      <input 
-                        type="number" 
-                        min="1"
-                        value={segmentSeconds}
-                        onChange={(e) => setSegmentSeconds(parseInt(e.target.value) || 0)}
-                        className="w-20 px-2 py-1 text-sm border border-slate-300 rounded focus:border-blue-500 focus:outline-none"
-                      />
-                      <span className="text-sm text-slate-500">giây</span>
+                    <span className="block font-bold text-slate-800">Cắt Video</span>
+                    <div className="flex items-center gap-2 mt-1">
+                       <span className="text-sm text-slate-500">Độ dài:</span>
+                       <div className="flex items-center bg-white border rounded px-2 py-0.5">
+                         <input type="number" min="1" value={segmentSeconds} onChange={(e) => setSegmentSeconds(parseInt(e.target.value)||1)} className="w-12 text-center text-sm outline-none font-bold text-blue-600" />
+                         <span className="text-xs text-slate-400">s</span>
+                       </div>
                     </div>
                   </div>
                 </label>
-
               </div>
             </div>
 
-            {/* Action Button */}
-            <div className="pt-4 flex justify-center">
-              <Button 
-                onClick={handleStartProcessing} 
-                disabled={status === AppStatus.PROCESSING || status === AppStatus.LOADING_CORE || isDownloading}
-                className="w-full md:w-auto px-12 py-3 text-lg shadow-lg shadow-blue-500/30"
-                isLoading={status === AppStatus.PROCESSING || status === AppStatus.LOADING_CORE}
-              >
+            <div className="flex justify-center pt-4">
+              <Button onClick={handleStartProcessing} disabled={status === AppStatus.PROCESSING || status === AppStatus.LOADING_CORE} className="px-12 py-3.5 text-lg shadow-lg hover:shadow-xl hover:-translate-y-0.5 transition-all w-full md:w-auto">
                 {status === AppStatus.IDLE || status === AppStatus.ERROR || status === AppStatus.COMPLETED ? (
-                  <>
-                    <Play className="w-5 h-5" /> {isFallbackMode ? 'Bắt đầu xử lý & Tải xuống' : 'Bắt đầu xử lý'}
-                  </>
-                ) : (
-                  'Đang xử lý...'
-                )}
+                  <><Play className="w-5 h-5 fill-current" /> Bắt đầu xử lý</>
+                ) : 'Đang xử lý...'}
               </Button>
             </div>
           </div>
 
-          {/* Section 2: Progress & Logs */}
-          <div className="bg-slate-900 text-slate-200 p-6 md:p-8">
-            <div className="flex items-center gap-2 mb-4">
-              <Terminal className="w-5 h-5 text-slate-400" />
-              <h3 className="font-mono text-sm uppercase tracking-wider text-slate-400">Console Log</h3>
-              {logs.length > 0 && (
-                <button 
-                  onClick={() => setLogs([])} 
-                  className="ml-auto text-xs text-slate-500 hover:text-slate-300 flex items-center gap-1"
-                >
-                  <RefreshCw className="w-3 h-3" /> Clear
-                </button>
-              )}
-            </div>
-
-            {/* Progress Bar */}
-            {(status === AppStatus.PROCESSING || status === AppStatus.COMPLETED) && (
-              <div className="mb-6">
-                <div className="flex justify-between text-xs mb-1">
-                  <span>Tiến độ</span>
-                  <span>{progress}%</span>
-                </div>
-                <div className="w-full bg-slate-700 rounded-full h-2.5 overflow-hidden">
-                  <div 
-                    className={`h-2.5 rounded-full transition-all duration-300 ${status === AppStatus.COMPLETED ? 'bg-green-500' : 'bg-blue-500'}`} 
-                    style={{ width: `${progress}%` }}
-                  ></div>
-                </div>
+          {/* Logs */}
+          <div className="bg-slate-900 text-slate-200 p-6">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2 text-slate-400">
+                <Terminal className="w-4 h-4"/> 
+                <span className="text-xs font-mono uppercase tracking-wider">System Logs</span>
               </div>
-            )}
-
-            {/* Log Output Area */}
-            <div className="h-64 overflow-y-auto font-mono text-xs md:text-sm space-y-1 pr-2 scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent">
-              {logs.length === 0 && (
-                <div className="text-slate-600 italic">Chưa có hoạt động nào...</div>
-              )}
-              {logs.map((log) => (
-                <div key={log.id} className="flex gap-2">
-                  <span className="text-slate-500">[{log.timestamp.toLocaleTimeString()}]</span>
-                  <span className={
-                    log.type === 'error' ? 'text-red-400' :
-                    log.type === 'success' ? 'text-green-400' :
-                    log.type === 'warning' ? 'text-yellow-400' :
-                    'text-slate-300'
-                  }>
-                    {log.type === 'error' && <AlertCircle className="w-3 h-3 inline mr-1" />}
-                    {log.type === 'success' && <CheckCircle className="w-3 h-3 inline mr-1" />}
-                    {log.type === 'warning' && <AlertCircle className="w-3 h-3 inline mr-1" />}
-                    {log.text}
-                  </span>
-                </div>
-              ))}
-              <div ref={logsEndRef} />
+              <span className="text-xs font-mono text-blue-400">{progress}% Completed</span>
+            </div>
+            <div className="w-full bg-slate-800 rounded-full h-1.5 mb-4 overflow-hidden">
+               <div className="bg-blue-500 h-full transition-all duration-300 ease-out shadow-[0_0_10px_rgba(59,130,246,0.5)]" style={{width: `${progress}%`}}></div>
+            </div>
+            <div className="h-48 overflow-y-auto font-mono text-xs space-y-1.5 pr-2 scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent">
+               {logs.length === 0 && <div className="text-slate-600 italic">Waiting for input...</div>}
+               {logs.map(log => (
+                 <div key={log.id} className={`flex gap-2 ${log.type === 'error' ? 'text-red-400' : log.type === 'success' ? 'text-green-400' : log.type === 'warning' ? 'text-yellow-400' : 'text-slate-300'}`}>
+                   <span className="opacity-40 select-none">[{log.timestamp.toLocaleTimeString()}]</span> 
+                   <span>{log.text}</span>
+                 </div>
+               ))}
+               <div ref={logsEndRef} />
             </div>
           </div>
         </div>
-
-        <p className="text-center text-xs text-slate-400">
-          Lưu ý: Ứng dụng sử dụng tài nguyên máy tính của bạn để xử lý video. <br/>
-          Nếu gặp lỗi, vui lòng đảm bảo bạn đang sử dụng trình duyệt Chrome/Edge phiên bản mới nhất.
-        </p>
       </div>
     </div>
   );

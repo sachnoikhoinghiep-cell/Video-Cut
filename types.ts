@@ -38,3 +38,15 @@ export interface LogMessage {
   timestamp: Date;
   type: 'info' | 'error' | 'success' | 'warning';
 }
+
+// Google Drive Config Types
+export interface GoogleDriveConfig {
+  clientId: string;
+  apiKey: string;
+  appId?: string; // Project ID from console (optional but good for Picker)
+}
+
+export interface DriveFolder {
+  id: string;
+  name: string;
+}
